@@ -1,0 +1,181 @@
+name: Promotion Plane Canary
+on:
+  status
+
+# Workflow-level: every run of this workflow for the same (sha, context) joins one group, whatever the state, even when its
+# job is later skipped by `if`. GitHub compares group names case-insensitively. Signal cleanup below is best effort only;
+# safety is the latest-status re-read before the final status, the exact-sha merge, branch protection and the read-back.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.sha }}-${{ github.event.context }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  promote:
+    # Cheap pre-filter only; the Python step re-validates everything and is the actual gate.
+    if: >-
+      !cancelled() &&
+      github.event.context == 'sprmed-verify-ready' &&
+      github.event.state == 'success' &&
+      github.event.sender.login == github.repository_owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write       # PUT /pulls/{n}/merge (also covers compare + PR reads)
+      pull-requests: read   # GET /commits/{sha}/pulls, GET /pulls/{n}
+      statuses: write       # GET /commits/{sha}/statuses, POST /statuses/{sha}
+    steps:
+      # No checkout: nothing from the PR is fetched or executed. Event fields are only read, never interpolated.
+      - name: Promote exact candidate SHA
+        shell: python
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          import json, os, re, signal, sys, urllib.error, urllib.request
+
+          API = os.environ.get('GITHUB_API_URL', 'https://api.github.com').rstrip('/')
+          REPO = os.environ['GITHUB_REPOSITORY']
+          OWNER = os.environ['GITHUB_REPOSITORY_OWNER'].lower()
+          TOKEN = os.environ['GITHUB_TOKEN']
+          RUN_URL = os.environ['RUN_URL']
+          RUN_ID = os.environ.get('GITHUB_RUN_ID', '')
+          READY = 'sprmed-verify-ready'
+          FINAL = 'sprmed-trusted-final'
+          HEX40 = re.compile(r'[0-9a-f]{40}')
+          DIGEST = re.compile(r'verify:([0-9a-f]{64})')
+
+
+          class Fail(Exception):
+              pass
+
+
+          def api(method, path, body=None, expect=(200,)):
+              req = urllib.request.Request(
+                  f'{API}/repos/{REPO}{path}', method=method,
+                  data=None if body is None else json.dumps(body).encode(),
+                  headers={'Authorization': f'Bearer {TOKEN}', 'Accept': 'application/vnd.github+json',
+                           'X-GitHub-Api-Version': '2022-11-28', 'Content-Type': 'application/json'})
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      code, raw = r.status, r.read()
+              except urllib.error.HTTPError as e:
+                  code, raw = e.code, e.read()
+              except (urllib.error.URLError, TimeoutError) as e:
+                  raise Fail(f'{method} {path} failed: {e}')
+              if code not in expect:
+                  raise Fail(f'{method} {path} -> HTTP {code}: {raw[:200]!r}')
+              try:
+                  return json.loads(raw)
+              except ValueError:
+                  raise Fail(f'{method} {path} returned non-JSON')
+
+
+          def latest_ready(sha):
+              # Statuses come newest first (documented), so the first hit of the context is its latest. The context is
+              # case-insensitive for GitHub. Walk pages until found; never guess: not found within the cap -> refuse.
+              for page in range(1, 51):
+                  rows = api('GET', f'/commits/{sha}/statuses?per_page=100&page={page}')
+                  for s in rows:
+                      if str(s.get('context', '')).lower() == READY:
+                          return s
+                  if len(rows) < 100:
+                      break
+              raise Fail('no status for the context on this sha')
+
+
+          def still_latest(sha, eid, desc):
+              s = latest_ready(sha)
+              if s.get('id') != eid or s.get('state') != 'success' or s.get('description') != desc:
+                  raise Fail('triggering status is no longer the latest success of its context')
+              creator = str((s.get('creator') or {}).get('login', ''))
+              if creator.lower() != OWNER:
+                  raise Fail('latest status was not created by the repository owner')
+              return creator
+
+
+          def on_cancel(signum, frame):
+              raise Fail(f'cancelled by signal {signum}')  # best-effort cleanup: lets the handler below revoke a published status
+
+
+          def transaction(state):
+              with open(os.environ['GITHUB_EVENT_PATH']) as f:
+                  ev = json.load(f)
+              sha, eid, desc = ev.get('sha'), ev.get('id'), ev.get('description')
+              if not (isinstance(sha, str) and HEX40.fullmatch(sha)):
+                  raise Fail('event sha must be lowercase 40-hex')
+              if str(ev.get('context', '')).lower() != READY or ev.get('state') != 'success':
+                  raise Fail(f'event is not {READY}=success')
+              if (ev.get('repository') or {}).get('full_name') != REPO:
+                  raise Fail('event repository mismatch')
+              if str((ev.get('sender') or {}).get('login', '')).lower() != OWNER:
+                  raise Fail('event sender is not the repository owner')
+              if not isinstance(eid, int) or isinstance(eid, bool):
+                  raise Fail('event id missing')
+              m = DIGEST.fullmatch(desc) if isinstance(desc, str) else None
+              if not m:
+                  raise Fail('description must be verify:<64-hex sha256 of the VERIFY receipt>')
+              digest = m.group(1)  # provenance only; never used as authorization
+              state['sha'] = sha
+
+              creator = still_latest(sha, eid, desc)  # fail fast; re-checked right before publishing the final status
+
+              open_prs = [p for p in api('GET', f'/commits/{sha}/pulls?per_page=100') if p.get('state') == 'open']
+              if len(open_prs) != 1:
+                  raise Fail(f'expected exactly 1 open PR for the sha, found {len(open_prs)}')
+              n = open_prs[0]['number']
+              pr = api('GET', f'/pulls/{n}')
+              if pr['state'] != 'open' or pr.get('merged'):
+                  raise Fail('PR is not open')
+              if pr['base']['ref'] != 'main' or pr['base']['repo']['full_name'] != REPO:
+                  raise Fail('PR base must be main of this repository')
+              if (pr['head'].get('repo') or {}).get('full_name') != REPO:
+                  raise Fail('PR head must live in this repository (fork or deleted head repo refused)')
+              if pr['head']['sha'] != sha:
+                  raise Fail(f'live head {pr["head"]["sha"]} != event sha')
+
+              still_latest(sha, eid, desc)
+              st = api('POST', f'/statuses/{sha}', {'state': 'success', 'context': FINAL,
+                       'description': f'promoted from {READY} #{eid}', 'target_url': RUN_URL}, expect=(201,))
+              state['published'] = True
+              if st.get('state') != 'success' or st.get('context') != FINAL:
+                  raise Fail(f'status response does not confirm {FINAL}=success')
+
+              # Atomic guard: GitHub refuses (409) when the live head differs from `sha`.
+              mg = api('PUT', f'/pulls/{n}/merge', {'sha': sha, 'merge_method': 'squash'}, expect=(200,))
+              msha = mg.get('sha')
+              if mg.get('merged') is not True or not (isinstance(msha, str) and HEX40.fullmatch(msha)):
+                  raise Fail('merge response did not confirm a merge')
+              state['merged'] = True
+
+              pr2 = api('GET', f'/pulls/{n}')
+              if pr2.get('merged') is not True or pr2.get('merge_commit_sha') != msha:
+                  raise Fail('read-back: PR not merged at the reported merge commit')
+              main = api('GET', '/git/ref/heads/main')['object']['sha']
+              # main may legitimately move on after our merge; it must be the merge commit or descend from it.
+              if api('GET', f'/compare/{msha}...{main}').get('status') not in ('identical', 'ahead'):
+                  raise Fail('read-back: main does not contain the merge commit')
+              return {'candidate_sha': sha, 'verify_status_id': eid, 'verify_receipt_digest': digest, 'verify_status_creator': creator,
+                      'pr_number': n, 'final_status_id': st.get('id'), 'final_status_creator': (st.get('creator') or {}).get('login'),
+                      'merged': True, 'merge_commit_sha': msha, 'resulting_main_sha': main, 'run_id': RUN_ID, 'run_url': RUN_URL}
+
+
+          signal.signal(signal.SIGTERM, on_cancel)
+          signal.signal(signal.SIGINT, on_cancel)
+          state = {'published': False, 'merged': False, 'sha': None}
+          try:
+              receipt = transaction(state)
+          except Exception as e:
+              print(f'::error::promotion refused: {e}')
+              if state['published'] and not state['merged']:
+                  try:  # a success status must not outlive a failed transaction
+                      api('POST', f'/statuses/{state["sha"]}', {'state': 'failure', 'context': FINAL,
+                          'description': 'promotion transaction failed', 'target_url': RUN_URL}, expect=(201,))
+                  except Exception as e2:
+                      print(f'::error::could not revoke status: {e2}')
+              sys.exit(1)
+          out = json.dumps(receipt, indent=2)
+          print(out)
+          with open(os.environ.get('GITHUB_STEP_SUMMARY', os.devnull), 'a') as f:
+              f.write('```json\n' + out + '\n```\n')
